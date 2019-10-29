@@ -28,7 +28,7 @@ LEVEL_CHOICES = click.Choice(LOG_LEVELS.keys())
 HTTP_CHOICES = click.Choice(HTTP_PROTOCOLS.keys())
 WS_CHOICES = click.Choice(WS_PROTOCOLS.keys())
 LIFESPAN_CHOICES = click.Choice(LIFESPAN.keys())
-LOOP_CHOICES = click.Choice(LOOP_SETUPS.keys())
+LOOP_CHOICES = click.Choice([key for key in LOOP_SETUPS.keys() if key != "none"])
 INTERFACE_CHOICES = click.Choice(INTERFACES)
 
 HANDLED_SIGNALS = (
@@ -267,7 +267,7 @@ def run(app, **kwargs):
             "auto-reload only works when app is passed as an import string."
         )
 
-    if isinstance(app, str) and (config.debug or config.reload):
+    if config.should_reload:
         sock = config.bind_socket()
         supervisor = StatReload(config)
         supervisor.run(server.run, sockets=[sock])
@@ -301,12 +301,12 @@ class Server:
         self.force_exit = False
         self.last_notified = 0
 
-    def run(self, sockets=None, shutdown_servers=True):
+    def run(self, sockets=None):
         self.config.setup_event_loop()
         loop = asyncio.get_event_loop()
         loop.run_until_complete(self.serve(sockets=sockets))
 
-    async def serve(self, sockets=None, shutdown_servers=True):
+    async def serve(self, sockets=None):
         process_id = os.getpid()
 
         config = self.config
@@ -323,16 +323,11 @@ class Server:
         if self.should_exit:
             return
         await self.main_loop()
-        await self.shutdown(shutdown_servers=shutdown_servers)
+        await self.shutdown()
         self.logger.info("Finished server process [{}]".format(process_id))
 
     async def startup(self, sockets=None):
         config = self.config
-
-        await self.lifespan.startup()
-        if self.lifespan.should_exit:
-            self.should_exit = True
-            return
 
         create_protocol = functools.partial(
             config.http_protocol_class, config=config, server_state=self.server_state
@@ -365,7 +360,9 @@ class Server:
             uds_perms = 0o666
             if os.path.exists(config.uds):
                 uds_perms = os.stat(config.uds).st_mode
-            server = await loop.create_unix_server(create_protocol, path=config.uds)
+            server = await loop.create_unix_server(
+                create_protocol, path=config.uds, ssl=config.ssl
+            )
             os.chmod(config.uds, uds_perms)
             message = "Uvicorn running on unix socket %s (Press CTRL+C to quit)"
             self.logger.info(message % config.uds)
@@ -373,15 +370,23 @@ class Server:
 
         else:
             # Standard case. Create a socket from a host/port pair.
-            server = await loop.create_server(
-                create_protocol, host=config.host, port=config.port, ssl=config.ssl
-            )
+            try:
+                server = await loop.create_server(
+                    create_protocol, host=config.host, port=config.port, ssl=config.ssl
+                )
+            except OSError as exc:
+                self.logger.error(exc)
+                sys.exit(1)
             protocol_name = "https" if config.ssl else "http"
             message = "Uvicorn running on %s://%s:%d (Press CTRL+C to quit)"
             self.logger.info(message % (protocol_name, config.host, config.port))
             self.servers = [server]
 
-        self.started = True
+        await self.lifespan.startup()
+        if self.lifespan.should_exit:
+            self.should_exit = True
+        else:
+            self.started = True
 
     async def main_loop(self):
         counter = 0
@@ -414,15 +419,14 @@ class Server:
             return self.server_state.total_requests >= self.config.limit_max_requests
         return False
 
-    async def shutdown(self, shutdown_servers=True):
+    async def shutdown(self):
         self.logger.info("Shutting down")
 
         # Stop accepting new connections.
-        if shutdown_servers:
-            for server in self.servers:
-                server.close()
-            for server in self.servers:
-                await server.wait_closed()
+        for server in self.servers:
+            server.close()
+        for server in self.servers:
+            await server.wait_closed()
 
         # Request shutdown on all existing connections.
         for connection in list(self.server_state.connections):

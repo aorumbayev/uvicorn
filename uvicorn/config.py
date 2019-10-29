@@ -1,6 +1,8 @@
 import asyncio
 import inspect
 import logging
+import os
+import platform
 import socket
 import ssl
 import sys
@@ -26,8 +28,8 @@ HTTP_PROTOCOLS = {
     "httptools": "uvicorn.protocols.http.httptools_impl:HttpToolsProtocol",
 }
 WS_PROTOCOLS = {
-    "none": None,
     "auto": "uvicorn.protocols.websockets.auto:AutoWebSocketsProtocol",
+    "none": None,
     "websockets": "uvicorn.protocols.websockets.websockets_impl:WebSocketProtocol",
     "wsproto": "uvicorn.protocols.websockets.wsproto_impl:WSProtocol",
 }
@@ -37,9 +39,11 @@ LIFESPAN = {
     "off": "uvicorn.lifespan.off:LifespanOff",
 }
 LOOP_SETUPS = {
+    "none": None,
     "auto": "uvicorn.loops.auto:auto_loop_setup",
     "asyncio": "uvicorn.loops.asyncio:asyncio_setup",
     "uvloop": "uvicorn.loops.uvloop:uvloop_setup",
+    "iocp": "uvicorn.loops.iocp:iocp_setup",
 }
 INTERFACES = ["auto", "asgi3", "asgi2", "wsgi"]
 
@@ -215,17 +219,31 @@ class Config:
 
     def setup_event_loop(self):
         loop_setup = import_from_string(LOOP_SETUPS[self.loop])
-        loop_setup()
+        if loop_setup is not None:
+            loop_setup()
 
     def bind_socket(self):
         sock = socket.socket()
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.host, self.port))
+        try:
+            sock.bind((self.host, self.port))
+        except OSError as exc:
+            self.logger_instance.error(exc)
+            sys.exit(1)
         sock.set_inheritable(True)
+
+        if platform.system() == "Windows" and (self.workers > 1 or self.should_reload):
+            #  We need to explicitly share the socket on Windows.
+            sock = socket.fromshare(sock.share(os.getpid()))
+
         message = "Uvicorn running on %s://%s:%d (Press CTRL+C to quit)"
         protocol_name = "https" if self.is_ssl else "http"
         self.logger_instance.info(message % (protocol_name, self.host, self.port))
         return sock
+
+    @property
+    def should_reload(self):
+        return isinstance(self.app, str) and (self.debug or self.reload)
 
     @property
     def logger_instance(self):

@@ -7,9 +7,9 @@ import h11
 
 from uvicorn.protocols.utils import (
     get_local_addr,
+    get_path_with_query_string,
     get_remote_addr,
     is_ssl,
-    get_path_with_query_string,
 )
 
 
@@ -141,7 +141,8 @@ class H11Protocol(asyncio.Protocol):
                 pass
 
         self.message_event.set()
-        self.flow.resume_writing()
+        if self.flow is not None:
+            self.flow.resume_writing()
 
     def eof_received(self):
         pass
@@ -441,6 +442,7 @@ class RequestResponseCycle:
                     get_path_with_query_string(self.scope),
                     self.scope["http_version"],
                     status_code,
+                    extra={"status_code": status_code, "scope": self.scope},
                 )
 
             # Write response status line and headers
